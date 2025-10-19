@@ -12,7 +12,8 @@ This Terraform module deploys an AWS Lambda function that uses Amazon Bedrock to
 
 The module creates:
 - AWS Lambda function (Python 3.13) with prompt injection detection logic
-- IAM role and policies for Lambda execution and Bedrock access
+- S3 bucket for custom prompt storage with encryption at rest, versioning, and optional access logging
+- IAM role and policies for Lambda execution, Bedrock access, and S3 read/write permissions
 - CloudWatch log group for Lambda logs
 - All necessary infrastructure for secure operation
 
@@ -22,7 +23,9 @@ The module creates:
 - **Multiple Security Checks**: Validates JSON structure, data types, and the absence of any extraneous content
 - **Deterministic Fallback**: If any validation fails, the Lambda returns `safe: false` with a deterministic reason
 - **Comprehensive Logging**: Complete model inputs (system instructions + user input) and outputs are logged to CloudWatch for audit and debugging
-- **Configurable Detection Prompt**: Customizable system prompt for detection logic
+- **S3-Based Prompt Override**: Optional custom prompts stored in S3 (bypasses 4KB Lambda env var limit)
+- **Default Strict Prompt**: Hardcoded general-purpose detection prompt works out-of-the-box
+- **Secure S3 Storage**: Encryption at rest (AES256), versioning enabled, public access blocked, optional access logging
 - **Flexible Naming**: Support for custom Lambda function naming with prepend/append options
 
 ## Architecture
@@ -32,9 +35,16 @@ The module creates:
                             │ CloudWatch Logs │
                             └────────▲────────┘
                                      │
+                            ┌────────────────┐
+                            │   S3 Bucket    │
+                            │ (optional      │
+                            │  custom prompt)│
+                            └────────┬───────┘
+                                     │
 User Input → Lambda Function ────────┼──────────→ Return
                           │          │
-                          ├─ Construct Prompt
+                          ├─ Load Prompt ─────→ S3 (if override specified)
+                          ├─ Construct Prompt    or use DEFAULT_PROMPT
                           ├─ Log Input ───────→ CloudWatch Logs
                           ├─ Call Bedrock API → AWS Bedrock
                           ├─ Receive Response ←──┘
@@ -45,13 +55,14 @@ User Input → Lambda Function ────────┼───────�
 
 The Lambda function execution flow:
 1. Receives user input via event payload
-2. Constructs a prompt using the configured system instructions
-3. Logs the complete input (system instructions + user input) to CloudWatch
-4. Calls AWS Bedrock Converse API with Claude Sonnet 4.5
-5. Receives response from Bedrock
-6. Logs the raw model output to CloudWatch
-7. Validates the model's response against strict criteria
-8. Returns a safe/unsafe determination
+2. Loads prompt template (from S3 if override specified, otherwise uses hardcoded DEFAULT_PROMPT)
+3. Constructs a prompt using the loaded system instructions
+4. Logs the complete input (system instructions + user input) to CloudWatch
+5. Calls AWS Bedrock Converse API with Claude Sonnet 4.5
+6. Receives response from Bedrock
+7. Logs the raw model output to CloudWatch
+8. Validates the model's response against strict criteria
+9. Returns a safe/unsafe determination
 
 ## Requirements
 
@@ -84,6 +95,82 @@ module "prompt_injection_detector" {
   lambda_memory_size  = 1024
 }
 ```
+
+### S3-Based Prompt Override
+
+The module creates an S3 bucket for storing custom detection prompts and Lambda has both **read and write permissions** to the bucket. This solves the 4KB Lambda environment variable limit for large, context-aware prompts and enables future enhancements like storing detected injection attempts.
+
+**Default Behavior** (no override):
+- Module uses a hardcoded default prompt in the Lambda code
+- Works out-of-the-box with strict, general-purpose detection
+- No S3 file needed
+
+**Custom Prompt Override**:
+
+```hcl
+module "prompt_injection_detector" {
+  source = "git@github.com:wayneworkman/terraform-module-prompt-injection-detection.git"
+
+  lambda_name_prepend  = "myapp"
+  prompt_override_key  = "custom_detection_prompt.txt"
+}
+
+# Upload custom prompt to module-created bucket
+resource "aws_s3_object" "custom_prompt" {
+  bucket  = module.prompt_injection_detector.bucket_id
+  key     = "custom_detection_prompt.txt"
+  content = file("${path.module}/my_custom_prompt.txt")
+}
+```
+
+**Key Points**:
+- **S3 bucket is always created** - provides `bucket_id` and `bucket_arn` outputs
+- **Lambda has read/write permissions** - can read prompts and write logs/detected attempts to bucket
+- **If `prompt_override_key` is empty/not set** → Uses hardcoded default prompt
+- **If `prompt_override_key` is specified** → Reads prompt from S3 (fails hard if key doesn't exist)
+- **Prompt is cached** - Loaded once per Lambda container lifecycle (performance optimization)
+- **No size limit** - S3 supports prompts of any size
+
+**Benefits**:
+- Bypass 4KB environment variable limit
+- Support context-aware prompts (multiple input types, correction handling)
+- Reduce false positives with custom detection logic
+- Maintain default strict behavior when override not needed
+- Enable future enhancements (e.g., storing detected injection attempts for analysis)
+
+### S3 Access Logging (Optional)
+
+The module supports optional S3 access logging to track all access to the prompt storage bucket. This is useful for security auditing and compliance.
+
+**Without logging (default):**
+```hcl
+module "prompt_injection_detector" {
+  source = "git@github.com:wayneworkman/terraform-module-prompt-injection-detection.git"
+  # s3_access_logging_bucket not set = no access logging
+}
+```
+
+**With access logging:**
+```hcl
+# Create a separate bucket for S3 access logs
+resource "aws_s3_bucket" "access_logs" {
+  bucket = "my-s3-access-logs"
+}
+
+# Enable access logging on the module bucket
+module "prompt_injection_detector" {
+  source = "git@github.com:wayneworkman/terraform-module-prompt-injection-detection.git"
+
+  s3_access_logging_bucket = aws_s3_bucket.access_logs.id
+  s3_access_logging_prefix = "prompt-injection-logs/"
+}
+```
+
+**Key Points**:
+- **Access logging is optional** - disabled by default
+- **Requires separate logging bucket** - you must create and manage the target bucket
+- **Prefix is optional** - defaults to root of logging bucket if not specified
+- **Logging bucket must exist** - Terraform will fail if bucket doesn't exist or Lambda can't write to it
 
 ### Invoking the Lambda
 
@@ -141,7 +228,7 @@ resource "aws_lambda_permission" "apigw" {
 
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|----------|
-| `prompt` | System prompt for prompt injection detection | `string` | See variables.tf | no |
+| `prompt_override_key` | S3 key for custom prompt (reads from module-created bucket). If empty, uses hardcoded default prompt | `string` | `""` | no |
 | `model_id` | AWS Bedrock model ID | `string` | `global.anthropic.claude-sonnet-4-5-20250929-v1:0` | no |
 | `max_tokens` | Maximum tokens for model response | `number` | `4096` | no |
 | `temperature` | Temperature setting for model inference | `number` | `1.0` | no |
@@ -150,6 +237,8 @@ resource "aws_lambda_permission" "apigw" {
 | `lambda_name_append` | Optional suffix for Lambda function name | `string` | `""` | no |
 | `lambda_timeout` | Lambda function timeout in seconds | `number` | `900` | no |
 | `lambda_memory_size` | Lambda function memory size in MB | `number` | `512` | no |
+| `s3_access_logging_bucket` | Optional S3 bucket for access logging. If not provided, access logging is disabled | `string` | `""` | no |
+| `s3_access_logging_prefix` | Optional prefix for S3 access logs (only used if s3_access_logging_bucket is provided) | `string` | `""` | no |
 
 ## Outputs
 
@@ -162,6 +251,8 @@ resource "aws_lambda_permission" "apigw" {
 | `lambda_role_name` | Name of the Lambda IAM role |
 | `cloudwatch_log_group_name` | Name of the CloudWatch log group |
 | `cloudwatch_log_group_arn` | ARN of the CloudWatch log group |
+| `bucket_id` | S3 bucket ID for prompt storage |
+| `bucket_arn` | S3 bucket ARN for prompt storage |
 
 ## Response Format
 
@@ -433,7 +524,7 @@ pytest -v
 
 #### Test Coverage
 
-The test suite includes **117 comprehensive unit tests** with **97% code coverage**:
+The test suite includes **146 comprehensive unit tests** with **98% code coverage**:
 
 - **Environment variable handling**: All required env vars, missing vars, invalid values, edge cases
 - **Event validation**: Missing user_input, invalid payloads
@@ -449,8 +540,13 @@ The test suite includes **117 comprehensive unit tests** with **97% code coverag
 - **Unicode handling**: Emoji, multilingual text, control characters, zero-width characters, RTL marks
 - **Response variations**: Different reasoning lengths, empty strings, special characters
 - **Input sanitization**: SQL injection patterns, XSS patterns, JSON injection, quotes, backslashes
+- **S3 prompt loading**: Default prompt mode, S3 override mode, caching behavior
+- **S3 edge cases**: Empty files, large files (1MB+, 10MB+), very long keys, special characters, Unicode keys
+- **S3 exception handling**: NoSuchKey, AccessDenied, throttling, InvalidObjectState, ClientError variants
+- **Encoding handling**: UTF-8, non-UTF-8, Latin-1, null bytes in content
+- **Concurrent behavior**: Cache consistency across multiple Lambda invocations
 
-**Test execution**: All tests pass in ~2 seconds
+**Test execution**: All tests pass in ~2.5 seconds
 
 ## Contributing
 

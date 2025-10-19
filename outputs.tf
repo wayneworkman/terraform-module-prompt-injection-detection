@@ -32,3 +32,13 @@ output "cloudwatch_log_group_arn" {
   description = "ARN of the CloudWatch log group"
   value       = aws_cloudwatch_log_group.lambda.arn
 }
+
+output "bucket_id" {
+  description = "S3 bucket ID for prompt storage"
+  value       = aws_s3_bucket.prompt_injection_storage.id
+}
+
+output "bucket_arn" {
+  description = "S3 bucket ARN for prompt storage"
+  value       = aws_s3_bucket.prompt_injection_storage.arn
+}

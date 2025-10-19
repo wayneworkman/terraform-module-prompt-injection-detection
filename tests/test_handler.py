@@ -7,28 +7,38 @@ Tests cover:
 - Bedrock API interaction
 - Response validation
 - Error conditions
+- S3 prompt loading
 """
 
 import json
 import os
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, Mock
 
 import pytest
 
 # Add lambda directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambda'))
 
-from handler import lambda_handler, validate_model_response
+from handler import lambda_handler, validate_model_response, load_prompt
+import handler
 
 
 class TestLambdaHandler:
     """Tests for the main lambda_handler function."""
 
+    @pytest.fixture(autouse=True)
+    def reset_prompt_cache(self):
+        """Reset the global prompt cache before each test."""
+        handler.PROMPT_TEMPLATE = None
+        yield
+        handler.PROMPT_TEMPLATE = None
+
     @pytest.fixture
     def mock_env(self, monkeypatch):
-        """Set up required environment variables."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt template')
+        """Set up required environment variables (uses default hardcoded prompt)."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')  # Empty = use default prompt
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -81,19 +91,19 @@ class TestLambdaHandler:
             assert result['safe'] is False
             assert result['reasoning'] == 'Prompt injection detected'
 
-    def test_missing_prompt_template_env_var(self, monkeypatch, valid_event):
-        """Test that missing PROMPT_TEMPLATE raises KeyError."""
+    def test_missing_prompt_bucket_env_var(self, monkeypatch, valid_event):
+        """Test that missing PROMPT_BUCKET raises KeyError."""
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
-        # PROMPT_TEMPLATE intentionally not set
+        # PROMPT_BUCKET intentionally not set
 
-        with pytest.raises(KeyError, match='PROMPT_TEMPLATE'):
+        with pytest.raises(KeyError, match='PROMPT_BUCKET'):
             lambda_handler(valid_event, None)
 
     def test_missing_model_id_env_var(self, monkeypatch, valid_event):
         """Test that missing MODEL_ID raises KeyError."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt')
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
         # MODEL_ID intentionally not set
@@ -103,7 +113,7 @@ class TestLambdaHandler:
 
     def test_missing_max_tokens_env_var(self, monkeypatch, valid_event):
         """Test that missing MAX_TOKENS raises KeyError."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt')
+        monkeypatch.setenv('PROMPT_BUCKET','Test prompt')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('TEMPERATURE', '0.5')
         # MAX_TOKENS intentionally not set
@@ -113,7 +123,7 @@ class TestLambdaHandler:
 
     def test_missing_temperature_env_var(self, monkeypatch, valid_event):
         """Test that missing TEMPERATURE raises KeyError."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt')
+        monkeypatch.setenv('PROMPT_BUCKET','Test prompt')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         # TEMPERATURE intentionally not set
@@ -123,7 +133,7 @@ class TestLambdaHandler:
 
     def test_invalid_max_tokens_value(self, monkeypatch, valid_event):
         """Test that invalid MAX_TOKENS value raises ValueError."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt')
+        monkeypatch.setenv('PROMPT_BUCKET','Test prompt')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', 'not-a-number')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -133,7 +143,7 @@ class TestLambdaHandler:
 
     def test_invalid_temperature_value(self, monkeypatch, valid_event):
         """Test that invalid TEMPERATURE value raises ValueError."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt')
+        monkeypatch.setenv('PROMPT_BUCKET','Test prompt')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', 'not-a-number')
@@ -290,7 +300,7 @@ class TestLambdaHandler:
             assert 'Invalid JSON' in result['reasoning']
 
     def test_prompt_template_included_in_request(self, mock_env, valid_event, mock_bedrock_response):
-        """Test that prompt template is included in the request to Bedrock."""
+        """Test that prompt template (DEFAULT_PROMPT) is included in the request to Bedrock."""
         with patch('boto3.client') as mock_client:
             mock_bedrock = MagicMock()
             mock_bedrock.converse.return_value = mock_bedrock_response
@@ -300,7 +310,8 @@ class TestLambdaHandler:
 
             call_args = mock_bedrock.converse.call_args
             request_text = call_args[1]['messages'][0]['content'][0]['text']
-            assert 'Test prompt template' in request_text
+            assert '=== BEGIN SYSTEM INSTRUCTIONS ===' in request_text
+            assert 'security analyzer' in request_text
             assert 'What is the weather today?' in request_text
             assert '=== END USER REQUEST ===' in request_text
 
@@ -603,7 +614,7 @@ class TestLambdaHandlerEdgeCases:
     @pytest.fixture
     def mock_env(self, monkeypatch):
         """Set up required environment variables."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt template')
+        monkeypatch.setenv('PROMPT_BUCKET','Test prompt template')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -729,7 +740,7 @@ class TestLambdaHandlerEdgeCases:
 
     def test_zero_max_tokens(self, monkeypatch):
         """Test with max_tokens set to 0."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test')
+        monkeypatch.setenv('PROMPT_BUCKET','Test')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '0')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -757,7 +768,7 @@ class TestLambdaHandlerEdgeCases:
 
     def test_negative_max_tokens(self, monkeypatch):
         """Test with negative max_tokens."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test')
+        monkeypatch.setenv('PROMPT_BUCKET','Test')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '-100')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -780,7 +791,7 @@ class TestLambdaHandlerEdgeCases:
 
     def test_zero_temperature(self, monkeypatch):
         """Test with temperature set to 0.0."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test')
+        monkeypatch.setenv('PROMPT_BUCKET','Test')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.0')
@@ -807,7 +818,7 @@ class TestLambdaHandlerEdgeCases:
 
     def test_negative_temperature(self, monkeypatch):
         """Test with negative temperature."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test')
+        monkeypatch.setenv('PROMPT_BUCKET','Test')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '-1.0')
@@ -834,7 +845,7 @@ class TestLambdaHandlerEdgeCases:
 
     def test_very_high_temperature(self, monkeypatch):
         """Test with very high temperature value."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test')
+        monkeypatch.setenv('PROMPT_BUCKET','Test')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '100.0')
@@ -861,7 +872,7 @@ class TestLambdaHandlerEdgeCases:
 
     def test_very_large_max_tokens(self, monkeypatch):
         """Test with very large max_tokens value."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test')
+        monkeypatch.setenv('PROMPT_BUCKET','Test')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -888,7 +899,7 @@ class TestLambdaHandlerEdgeCases:
 
     def test_empty_prompt_template(self, monkeypatch):
         """Test with empty prompt template."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', '')
+        monkeypatch.setenv('PROMPT_BUCKET','')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -943,7 +954,7 @@ class TestBedrockAPIExceptions:
     @pytest.fixture
     def mock_env(self, monkeypatch):
         """Set up required environment variables."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt template')
+        monkeypatch.setenv('PROMPT_BUCKET','Test prompt template')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1078,7 +1089,7 @@ class TestLoggingVerification:
     @pytest.fixture
     def mock_env(self, monkeypatch):
         """Set up required environment variables."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'System instructions here')
+        monkeypatch.setenv('PROMPT_BUCKET','System instructions here')
         monkeypatch.setenv('MODEL_ID', 'test-model-id')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1108,8 +1119,9 @@ class TestLoggingVerification:
             assert 'MODEL INPUT (complete prompt sent to Bedrock):' in captured.out
             assert '=' * 80 in captured.out
 
-            # Verify system instructions are logged
-            assert 'System instructions here' in captured.out
+            # Verify default prompt is logged
+            assert '=== BEGIN SYSTEM INSTRUCTIONS ===' in captured.out
+            assert 'security analyzer' in captured.out
 
             # Verify user input is logged
             assert 'What is the weather?' in captured.out
@@ -1207,9 +1219,10 @@ class TestLoggingVerification:
 class TestEnvironmentVariableEdgeCases:
     """Test edge cases for environment variables."""
 
-    def test_empty_prompt_template_string(self, monkeypatch):
-        """Test with empty PROMPT_TEMPLATE."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', '')
+    def test_empty_prompt_bucket_uses_default(self, monkeypatch):
+        """Test that DEFAULT_PROMPT is used when PROMPT_BUCKET is empty (no override)."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')  # No override = use default
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1229,13 +1242,15 @@ class TestEnvironmentVariableEdgeCases:
             }
             mock_client.return_value = mock_bedrock
 
-            # Should process with empty prompt template
+            # Should process with DEFAULT_PROMPT
             result = lambda_handler(event, None)
 
-            # Verify it was called with empty template
+            # Verify it was called with DEFAULT_PROMPT
             call_args = mock_bedrock.converse.call_args
             messages = call_args[1]['messages']
-            assert messages[0]['content'][0]['text'].startswith('\n')
+            prompt_text = messages[0]['content'][0]['text']
+            assert '=== BEGIN SYSTEM INSTRUCTIONS ===' in prompt_text
+            assert 'security analyzer' in prompt_text
 
             # Verify handler returns result correctly
             assert result['safe'] is True
@@ -1243,7 +1258,7 @@ class TestEnvironmentVariableEdgeCases:
 
     def test_whitespace_only_model_id(self, monkeypatch):
         """Test with whitespace-only MODEL_ID."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt')
+        monkeypatch.setenv('PROMPT_BUCKET','Test prompt')
         monkeypatch.setenv('MODEL_ID', '   ')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1270,9 +1285,10 @@ class TestEnvironmentVariableEdgeCases:
             call_args = mock_bedrock.converse.call_args
             assert call_args[1]['modelId'] == '   '
 
-    def test_whitespace_only_prompt_template(self, monkeypatch):
-        """Test with whitespace-only PROMPT_TEMPLATE."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', '   \n\t   ')
+    def test_whitespace_only_override_key_uses_default(self, monkeypatch):
+        """Test that DEFAULT_PROMPT is used when PROMPT_OVERRIDE_KEY is whitespace."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '   \n\t   ')  # Whitespace = use default
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1292,14 +1308,15 @@ class TestEnvironmentVariableEdgeCases:
             }
             mock_client.return_value = mock_bedrock
 
-            # Should process with whitespace prompt
+            # Should process with DEFAULT_PROMPT (not whitespace)
             lambda_handler(event, None)
 
-            # Verify prompt contains whitespace
+            # Verify prompt uses DEFAULT_PROMPT
             call_args = mock_bedrock.converse.call_args
             messages = call_args[1]['messages']
             prompt_text = messages[0]['content'][0]['text']
-            assert '   \n\t   ' in prompt_text
+            assert '=== BEGIN SYSTEM INSTRUCTIONS ===' in prompt_text
+            assert 'security analyzer' in prompt_text
 
 
 class TestCodeCoverageGaps:
@@ -1409,7 +1426,7 @@ class TestResponseStructureEdgeCases:
     @pytest.fixture
     def mock_env(self, monkeypatch):
         """Set up required environment variables."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Test prompt')
+        monkeypatch.setenv('PROMPT_BUCKET','Test prompt')
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1497,10 +1514,18 @@ class TestResponseStructureEdgeCases:
 class TestPromptConstructionEdgeCases:
     """Test edge cases for prompt construction."""
 
+    @pytest.fixture(autouse=True)
+    def reset_prompt_cache(self):
+        """Reset the global prompt cache before each test."""
+        handler.PROMPT_TEMPLATE = None
+        yield
+        handler.PROMPT_TEMPLATE = None
+
     @pytest.fixture
     def mock_env(self, monkeypatch):
         """Set up required environment variables."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'System prompt here')
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1557,11 +1582,12 @@ class TestPromptConstructionEdgeCases:
             prompt = call_args[1]['messages'][0]['content'][0]['text']
             assert 'Line 1\n\n\nLine 2\n\n\n\nLine 3' in prompt
 
-    def test_prompt_template_actually_included(self, mock_env):
-        """Test that the exact prompt template is included in the request."""
+    def test_prompt_template_actually_included_with_s3_override(self, mock_env):
+        """Test that custom S3 prompt template is included in the request."""
         monkeypatch = pytest.MonkeyPatch()
         unique_prompt = "UNIQUE_SYSTEM_PROMPT_12345_TESTING"
-        monkeypatch.setenv('PROMPT_TEMPLATE', unique_prompt)
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1569,6 +1595,13 @@ class TestPromptConstructionEdgeCases:
         event = {'user_input': 'test input'}
 
         with patch('boto3.client') as mock_client:
+            # Mock S3
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=unique_prompt.encode('utf-8')))
+            }
+
+            # Mock Bedrock
             mock_bedrock = MagicMock()
             mock_bedrock.converse.return_value = {
                 'output': {
@@ -1579,16 +1612,24 @@ class TestPromptConstructionEdgeCases:
                     }
                 }
             }
-            mock_client.return_value = mock_bedrock
+
+            # Return appropriate mock based on service
+            def client_side_effect(service, **kwargs):
+                if service == 's3':
+                    return mock_s3
+                elif service == 'bedrock-runtime':
+                    return mock_bedrock
+                return MagicMock()
+
+            mock_client.side_effect = client_side_effect
 
             lambda_handler(event, None)
 
-            # Verify exact prompt template is in the request
+            # Verify exact custom prompt template from S3 is in the request
             call_args = mock_bedrock.converse.call_args
             prompt = call_args[1]['messages'][0]['content'][0]['text']
             assert unique_prompt in prompt
             assert 'test input' in prompt
-            assert prompt.startswith(unique_prompt)
 
     def test_user_input_with_formatting_characters(self, mock_env):
         """Test user input with special formatting that might interfere."""
@@ -1647,7 +1688,7 @@ class TestUnicodeAndSpecialCharactersInUserInput:
     @pytest.fixture
     def mock_env(self, monkeypatch):
         """Set up required environment variables."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'System prompt')
+        monkeypatch.setenv('PROMPT_BUCKET','System prompt')
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1829,7 +1870,7 @@ class TestDifferentValidResponseVariations:
     @pytest.fixture
     def mock_env(self, monkeypatch):
         """Set up required environment variables."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'System prompt')
+        monkeypatch.setenv('PROMPT_BUCKET','System prompt')
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -1988,7 +2029,7 @@ class TestInputSanitizationAndSecurity:
     @pytest.fixture
     def mock_env(self, monkeypatch):
         """Set up required environment variables."""
-        monkeypatch.setenv('PROMPT_TEMPLATE', 'Detect prompt injection')
+        monkeypatch.setenv('PROMPT_BUCKET','Detect prompt injection')
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -2167,3 +2208,561 @@ class TestInputSanitizationAndSecurity:
             prompt = call_args[1]['messages'][0]['content'][0]['text']
             assert '"malicious"' in prompt or 'malicious' in prompt
             assert result['safe'] is False
+
+
+class TestS3PromptLoading:
+    """Tests for S3-based prompt loading functionality."""
+
+    @pytest.fixture(autouse=True)
+    def reset_prompt_cache(self):
+        """Reset the global prompt cache before each test."""
+        handler.PROMPT_TEMPLATE = None
+        yield
+        handler.PROMPT_TEMPLATE = None
+
+    def test_load_prompt_uses_default_when_no_override_key(self, monkeypatch):
+        """Test that load_prompt uses DEFAULT_PROMPT when PROMPT_OVERRIDE_KEY is empty."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')
+
+        prompt = load_prompt()
+
+        assert prompt == handler.DEFAULT_PROMPT
+        assert '=== BEGIN SYSTEM INSTRUCTIONS ===' in prompt
+        assert 'security analyzer' in prompt
+
+    def test_load_prompt_uses_default_when_override_key_whitespace(self, monkeypatch):
+        """Test that load_prompt uses DEFAULT_PROMPT when PROMPT_OVERRIDE_KEY is whitespace."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '   \t\n   ')
+
+        prompt = load_prompt()
+
+        assert prompt == handler.DEFAULT_PROMPT
+
+    def test_load_prompt_uses_default_when_override_key_not_set(self, monkeypatch):
+        """Test that load_prompt uses DEFAULT_PROMPT when PROMPT_OVERRIDE_KEY not in env."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.delenv('PROMPT_OVERRIDE_KEY', raising=False)
+
+        prompt = load_prompt()
+
+        assert prompt == handler.DEFAULT_PROMPT
+
+    def test_load_prompt_reads_from_s3_when_override_key_provided(self, monkeypatch):
+        """Test that load_prompt reads from S3 when PROMPT_OVERRIDE_KEY is provided."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompt.txt')
+
+        custom_prompt = "This is a custom security prompt from S3"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_response = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_s3.get_object.return_value = mock_response
+            mock_client.return_value = mock_s3
+
+            prompt = load_prompt()
+
+            assert prompt == custom_prompt
+            mock_s3.get_object.assert_called_once_with(
+                Bucket='my-bucket',
+                Key='custom_prompt.txt'
+            )
+
+    def test_load_prompt_raises_on_s3_key_not_found(self, monkeypatch):
+        """Test that load_prompt raises ValueError when S3 key doesn't exist."""
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'nonexistent.txt')
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            error = ClientError(
+                {'Error': {'Code': 'NoSuchKey', 'Message': 'Key not found'}},
+                'GetObject'
+            )
+            mock_s3.get_object.side_effect = error
+            mock_client.return_value = mock_s3
+
+            with pytest.raises(ValueError, match='does not exist in bucket'):
+                load_prompt()
+
+    def test_load_prompt_raises_on_s3_access_error(self, monkeypatch):
+        """Test that load_prompt raises exception on S3 access errors."""
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompt.txt')
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            error = ClientError(
+                {'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}},
+                'GetObject'
+            )
+            mock_s3.get_object.side_effect = error
+            mock_client.return_value = mock_s3
+
+            with pytest.raises(ClientError):
+                load_prompt()
+
+    def test_load_prompt_caches_result(self, monkeypatch):
+        """Test that load_prompt caches the result and doesn't reload on subsequent calls."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompt.txt')
+
+        custom_prompt = "Custom prompt content"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_response = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_s3.get_object.return_value = mock_response
+            mock_client.return_value = mock_s3
+
+            # First call - should read from S3
+            prompt1 = load_prompt()
+            assert prompt1 == custom_prompt
+            assert mock_s3.get_object.call_count == 1
+
+            # Second call - should use cache, not call S3 again
+            prompt2 = load_prompt()
+            assert prompt2 == custom_prompt
+            assert mock_s3.get_object.call_count == 1  # Still 1, not 2
+
+    def test_load_prompt_caches_default_prompt(self, monkeypatch):
+        """Test that load_prompt caches DEFAULT_PROMPT on subsequent calls."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')
+
+        # First call
+        prompt1 = load_prompt()
+        assert prompt1 == handler.DEFAULT_PROMPT
+
+        # Modify env var (shouldn't matter due to cache)
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'should-not-be-used.txt')
+
+        # Second call - should still return cached DEFAULT_PROMPT
+        prompt2 = load_prompt()
+        assert prompt2 == handler.DEFAULT_PROMPT
+
+    def test_lambda_handler_with_s3_override(self, monkeypatch):
+        """Test lambda_handler end-to-end with S3 prompt override."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompt.txt')
+        monkeypatch.setenv('MODEL_ID', 'test-model')
+        monkeypatch.setenv('MAX_TOKENS', '1000')
+        monkeypatch.setenv('TEMPERATURE', '0.5')
+
+        custom_prompt = "Custom security analyzer instructions"
+        event = {'user_input': 'test input'}
+
+        with patch('boto3.client') as mock_client:
+            # Mock S3
+            mock_s3 = MagicMock()
+            mock_s3_response = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_s3.get_object.return_value = mock_s3_response
+
+            # Mock Bedrock
+            mock_bedrock = MagicMock()
+            mock_bedrock.converse.return_value = {
+                'output': {
+                    'message': {
+                        'content': [
+                            {'text': '{"safe": true, "reasoning": "All good"}'}
+                        ]
+                    }
+                }
+            }
+
+            # boto3.client returns different mocks based on service name
+            def client_side_effect(service, **kwargs):
+                if service == 's3':
+                    return mock_s3
+                elif service == 'bedrock-runtime':
+                    return mock_bedrock
+                return MagicMock()
+
+            mock_client.side_effect = client_side_effect
+
+            result = lambda_handler(event, None)
+
+            # Verify S3 was called
+            mock_s3.get_object.assert_called_once_with(
+                Bucket='my-bucket',
+                Key='custom_prompt.txt'
+            )
+
+            # Verify custom prompt was used in Bedrock call
+            bedrock_call_args = mock_bedrock.converse.call_args
+            sent_prompt = bedrock_call_args[1]['messages'][0]['content'][0]['text']
+            assert custom_prompt in sent_prompt
+            assert 'test input' in sent_prompt
+
+            assert result['safe'] is True
+
+    def test_lambda_handler_fails_when_s3_key_missing(self, monkeypatch):
+        """Test lambda_handler fails hard when S3 key doesn't exist."""
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'missing.txt')
+        monkeypatch.setenv('MODEL_ID', 'test-model')
+        monkeypatch.setenv('MAX_TOKENS', '1000')
+        monkeypatch.setenv('TEMPERATURE', '0.5')
+
+        event = {'user_input': 'test input'}
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            error = ClientError(
+                {'Error': {'Code': 'NoSuchKey', 'Message': 'Key not found'}},
+                'GetObject'
+            )
+            mock_s3.get_object.side_effect = error
+            mock_client.return_value = mock_s3
+
+            with pytest.raises(ValueError, match='does not exist'):
+                lambda_handler(event, None)
+
+    def test_load_prompt_logs_default_mode(self, monkeypatch, caplog):
+        """Test that load_prompt logs when using default prompt."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')
+
+        with caplog.at_level('INFO'):
+            load_prompt()
+
+        assert 'Using default hardcoded prompt' in caplog.text
+
+    def test_load_prompt_logs_s3_mode(self, monkeypatch, caplog):
+        """Test that load_prompt logs when loading from S3."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
+
+        custom_prompt = "Custom prompt"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_response = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_s3.get_object.return_value = mock_response
+            mock_client.return_value = mock_s3
+
+            with caplog.at_level('INFO'):
+                load_prompt()
+
+            assert 'Loading custom prompt from S3' in caplog.text
+            assert 's3://my-bucket/custom.txt' in caplog.text
+            assert 'Successfully loaded custom prompt from S3' in caplog.text
+
+
+class TestS3EdgeCasesAndErrors:
+    """Tests for S3 edge cases, error handling, and content validation."""
+
+    @pytest.fixture(autouse=True)
+    def reset_prompt_cache(self):
+        """Reset the global prompt cache before each test."""
+        handler.PROMPT_TEMPLATE = None
+        yield
+        handler.PROMPT_TEMPLATE = None
+
+    def test_missing_prompt_bucket_env_var_raises_keyerror(self, monkeypatch):
+        """Test that missing PROMPT_BUCKET raises KeyError."""
+        monkeypatch.delenv('PROMPT_BUCKET', raising=False)
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')
+
+        with pytest.raises(KeyError, match='PROMPT_BUCKET'):
+            load_prompt()
+
+    def test_empty_prompt_bucket_value(self, monkeypatch):
+        """Test behavior with empty PROMPT_BUCKET string."""
+        monkeypatch.setenv('PROMPT_BUCKET', '')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')
+
+        # Should use default prompt with empty bucket name
+        prompt = load_prompt()
+        assert prompt == handler.DEFAULT_PROMPT
+
+    def test_whitespace_only_prompt_bucket(self, monkeypatch):
+        """Test behavior with whitespace-only PROMPT_BUCKET."""
+        monkeypatch.setenv('PROMPT_BUCKET', '   \t\n   ')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')
+
+        # Should still work and use default prompt
+        prompt = load_prompt()
+        assert prompt == handler.DEFAULT_PROMPT
+
+    def test_load_prompt_with_empty_s3_file(self, monkeypatch):
+        """Test loading empty file from S3 returns empty string."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'empty.txt')
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=b''))
+            }
+            mock_client.return_value = mock_s3
+
+            prompt = load_prompt()
+            assert prompt == ""
+
+    def test_load_prompt_with_very_large_file(self, monkeypatch):
+        """Test loading 1MB prompt from S3."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'large.txt')
+
+        large_prompt = "A" * (1024 * 1024)  # 1MB
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=large_prompt.encode('utf-8')))
+            }
+            mock_client.return_value = mock_s3
+
+            prompt = load_prompt()
+            assert len(prompt) == 1024 * 1024
+            assert prompt == large_prompt
+
+    def test_load_prompt_with_10mb_file(self, monkeypatch):
+        """Test loading 10MB prompt from S3."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'very_large.txt')
+
+        very_large_prompt = "B" * (10 * 1024 * 1024)  # 10MB
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=very_large_prompt.encode('utf-8')))
+            }
+            mock_client.return_value = mock_s3
+
+            prompt = load_prompt()
+            assert len(prompt) == 10 * 1024 * 1024
+            assert prompt[:100] == "B" * 100
+
+    def test_load_prompt_handles_s3_client_error(self, monkeypatch):
+        """Test handling of boto3 ClientError."""
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            error = ClientError(
+                {'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}},
+                'GetObject'
+            )
+            mock_s3.get_object.side_effect = error
+            mock_client.return_value = mock_s3
+
+            with pytest.raises(ClientError):
+                load_prompt()
+
+    def test_load_prompt_handles_s3_throttling(self, monkeypatch):
+        """Test handling of S3 throttling exception."""
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            error = ClientError(
+                {'Error': {'Code': 'SlowDown', 'Message': 'Please reduce your request rate'}},
+                'GetObject'
+            )
+            mock_s3.get_object.side_effect = error
+            mock_client.return_value = mock_s3
+
+            with pytest.raises(ClientError) as exc_info:
+                load_prompt()
+            assert 'SlowDown' in str(exc_info.value)
+
+    def test_load_prompt_handles_invalid_object_state(self, monkeypatch):
+        """Test handling of InvalidObjectState error (e.g., Glacier)."""
+        from botocore.exceptions import ClientError
+
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'archived.txt')
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            error = ClientError(
+                {'Error': {'Code': 'InvalidObjectState', 'Message': 'Object is archived'}},
+                'GetObject'
+            )
+            mock_s3.get_object.side_effect = error
+            mock_client.return_value = mock_s3
+
+            with pytest.raises(ClientError) as exc_info:
+                load_prompt()
+            assert 'InvalidObjectState' in str(exc_info.value)
+
+    def test_load_prompt_with_non_utf8_encoding_fails(self, monkeypatch):
+        """Test error handling for non-UTF-8 content."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'binary.txt')
+
+        # Invalid UTF-8 byte sequence
+        invalid_utf8 = b'\x80\x81\x82\x83'
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=invalid_utf8))
+            }
+            mock_client.return_value = mock_s3
+
+            with pytest.raises(UnicodeDecodeError):
+                load_prompt()
+
+    def test_load_prompt_with_latin1_encoding(self, monkeypatch):
+        """Test handling of Latin-1 encoded content."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'latin1.txt')
+
+        # Latin-1 specific characters (ñ, é, etc.)
+        latin1_text = "Niño está aquí"
+        latin1_bytes = latin1_text.encode('latin-1')
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=latin1_bytes))
+            }
+            mock_client.return_value = mock_s3
+
+            # Will fail trying to decode as UTF-8
+            with pytest.raises(UnicodeDecodeError):
+                load_prompt()
+
+    def test_load_prompt_with_null_bytes(self, monkeypatch):
+        """Test handling of content with null bytes."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'null_bytes.txt')
+
+        content_with_nulls = b'Test\x00content\x00with\x00nulls'
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=content_with_nulls))
+            }
+            mock_client.return_value = mock_s3
+
+            prompt = load_prompt()
+            # Should decode successfully but contain null characters
+            assert '\x00' in prompt
+            assert 'Test\x00content' in prompt
+
+    def test_very_long_s3_key_name(self, monkeypatch):
+        """Test handling of very long S3 key names (1024 chars)."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        long_key = 'a' * 1024
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', long_key)
+
+        custom_prompt = "Test prompt"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_client.return_value = mock_s3
+
+            prompt = load_prompt()
+            assert prompt == custom_prompt
+            # Verify S3 was called with the long key
+            mock_s3.get_object.assert_called_once_with(
+                Bucket='my-bucket',
+                Key=long_key
+            )
+
+    def test_s3_key_with_special_characters(self, monkeypatch):
+        """Test S3 keys with special characters."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        special_key = 'prompts/my-prompt (v2) [final].txt'
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', special_key)
+
+        custom_prompt = "Test prompt"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_client.return_value = mock_s3
+
+            prompt = load_prompt()
+            assert prompt == custom_prompt
+
+    def test_s3_key_with_unicode_characters(self, monkeypatch):
+        """Test S3 keys with Unicode characters."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        unicode_key = 'prompts/日本語/プロンプト.txt'
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', unicode_key)
+
+        custom_prompt = "Test prompt"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_client.return_value = mock_s3
+
+            prompt = load_prompt()
+            assert prompt == custom_prompt
+
+    def test_concurrent_lambda_invocations_cache_behavior(self, monkeypatch):
+        """Test that cache works correctly across multiple calls."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
+
+        custom_prompt = "Custom prompt"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_client.return_value = mock_s3
+
+            # Simulate 10 concurrent invocations
+            for i in range(10):
+                prompt = load_prompt()
+                assert prompt == custom_prompt
+
+            # S3 should only be called once due to caching
+            assert mock_s3.get_object.call_count == 1
+
+    def test_load_prompt_with_very_long_bucket_name(self, monkeypatch):
+        """Test with very long bucket name (63 chars - S3 max)."""
+        long_bucket = 'a' * 63
+        monkeypatch.setenv('PROMPT_BUCKET', long_bucket)
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'test.txt')
+
+        custom_prompt = "Test"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_client.return_value = mock_s3
+
+            prompt = load_prompt()
+            assert prompt == custom_prompt

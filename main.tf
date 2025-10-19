@@ -23,6 +23,55 @@ locals {
   ]))
 }
 
+# S3 Bucket for prompt storage (always created)
+resource "aws_s3_bucket" "prompt_injection_storage" {
+  bucket_prefix = "${var.lambda_name_prepend != "" ? "${var.lambda_name_prepend}-" : ""}prompt-injection-"
+
+  tags = {
+    Purpose = "Prompt injection detection storage"
+    Module  = "terraform-module-prompt-injection-detection"
+  }
+}
+
+# Block public access to S3 bucket
+resource "aws_s3_bucket_public_access_block" "prompt_injection_storage" {
+  bucket = aws_s3_bucket.prompt_injection_storage.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Enable encryption at rest for S3 bucket
+resource "aws_s3_bucket_server_side_encryption_configuration" "prompt_injection_storage" {
+  bucket = aws_s3_bucket.prompt_injection_storage.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# Enable versioning for S3 bucket
+resource "aws_s3_bucket_versioning" "prompt_injection_storage" {
+  bucket = aws_s3_bucket.prompt_injection_storage.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# Enable S3 access logging (optional)
+resource "aws_s3_bucket_logging" "prompt_injection_storage" {
+  count = var.s3_access_logging_bucket != "" ? 1 : 0
+
+  bucket = aws_s3_bucket.prompt_injection_storage.id
+
+  target_bucket = var.s3_access_logging_bucket
+  target_prefix = var.s3_access_logging_prefix
+}
 
 # CloudWatch Log Group for Lambda
 resource "aws_cloudwatch_log_group" "lambda" {
@@ -88,6 +137,26 @@ resource "aws_iam_role_policy" "lambda_bedrock" {
   })
 }
 
+# IAM Policy for S3 (prompt storage)
+resource "aws_iam_role_policy" "lambda_s3" {
+  name = "${local.lambda_name}-s3-policy"
+  role = aws_iam_role.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject"
+        ]
+        Resource = "${aws_s3_bucket.prompt_injection_storage.arn}/*"
+      }
+    ]
+  })
+}
+
 # Create Lambda deployment package
 data "archive_file" "lambda" {
   type        = "zip"
@@ -108,16 +177,18 @@ resource "aws_lambda_function" "detector" {
 
   environment {
     variables = {
-      PROMPT_TEMPLATE = var.prompt
-      MODEL_ID        = var.model_id
-      MAX_TOKENS      = tostring(var.max_tokens)
-      TEMPERATURE     = tostring(var.temperature)
+      PROMPT_BUCKET       = aws_s3_bucket.prompt_injection_storage.id
+      PROMPT_OVERRIDE_KEY = var.prompt_override_key
+      MODEL_ID            = var.model_id
+      MAX_TOKENS          = tostring(var.max_tokens)
+      TEMPERATURE         = tostring(var.temperature)
     }
   }
 
   depends_on = [
     aws_cloudwatch_log_group.lambda,
     aws_iam_role_policy.lambda_logs,
-    aws_iam_role_policy.lambda_bedrock
+    aws_iam_role_policy.lambda_bedrock,
+    aws_iam_role_policy.lambda_s3
   ]
 }

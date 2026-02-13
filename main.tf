@@ -151,7 +151,7 @@ resource "aws_iam_role_policy" "lambda_s3" {
           "s3:GetObject",
           "s3:PutObject"
         ]
-        Resource = "${aws_s3_bucket.prompt_injection_storage.arn}/*"
+        Resource = "${aws_s3_bucket.prompt_injection_storage.arn}/custom_prompts/*"
       }
     ]
   })

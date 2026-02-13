@@ -20,7 +20,7 @@ import pytest
 # Add lambda directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lambda'))
 
-from handler import lambda_handler, validate_model_response, load_prompt
+from handler import lambda_handler, validate_model_response, load_prompt, validate_prompt_override_key
 import handler
 
 
@@ -30,9 +30,9 @@ class TestLambdaHandler:
     @pytest.fixture(autouse=True)
     def reset_prompt_cache(self):
         """Reset the global prompt cache before each test."""
-        handler.PROMPT_TEMPLATE = None
+        handler.PROMPT_CACHE = {}
         yield
-        handler.PROMPT_TEMPLATE = None
+        handler.PROMPT_CACHE = {}
 
     @pytest.fixture
     def mock_env(self, monkeypatch):
@@ -1517,9 +1517,9 @@ class TestPromptConstructionEdgeCases:
     @pytest.fixture(autouse=True)
     def reset_prompt_cache(self):
         """Reset the global prompt cache before each test."""
-        handler.PROMPT_TEMPLATE = None
+        handler.PROMPT_CACHE = {}
         yield
-        handler.PROMPT_TEMPLATE = None
+        handler.PROMPT_CACHE = {}
 
     @pytest.fixture
     def mock_env(self, monkeypatch):
@@ -1587,7 +1587,7 @@ class TestPromptConstructionEdgeCases:
         monkeypatch = pytest.MonkeyPatch()
         unique_prompt = "UNIQUE_SYSTEM_PROMPT_12345_TESTING"
         monkeypatch.setenv('PROMPT_BUCKET', 'my-test-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/custom.txt')
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -2216,9 +2216,9 @@ class TestS3PromptLoading:
     @pytest.fixture(autouse=True)
     def reset_prompt_cache(self):
         """Reset the global prompt cache before each test."""
-        handler.PROMPT_TEMPLATE = None
+        handler.PROMPT_CACHE = {}
         yield
-        handler.PROMPT_TEMPLATE = None
+        handler.PROMPT_CACHE = {}
 
     def test_load_prompt_uses_default_when_no_override_key(self, monkeypatch):
         """Test that load_prompt uses DEFAULT_PROMPT when PROMPT_OVERRIDE_KEY is empty."""
@@ -2252,7 +2252,7 @@ class TestS3PromptLoading:
     def test_load_prompt_reads_from_s3_when_override_key_provided(self, monkeypatch):
         """Test that load_prompt reads from S3 when PROMPT_OVERRIDE_KEY is provided."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompt.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/custom_prompt.txt')
 
         custom_prompt = "This is a custom security prompt from S3"
 
@@ -2269,7 +2269,7 @@ class TestS3PromptLoading:
             assert prompt == custom_prompt
             mock_s3.get_object.assert_called_once_with(
                 Bucket='my-bucket',
-                Key='custom_prompt.txt'
+                Key='custom_prompts/custom_prompt.txt'
             )
 
     def test_load_prompt_raises_on_s3_key_not_found(self, monkeypatch):
@@ -2277,7 +2277,7 @@ class TestS3PromptLoading:
         from botocore.exceptions import ClientError
 
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'nonexistent.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/nonexistent.txt')
 
         with patch('boto3.client') as mock_client:
             mock_s3 = MagicMock()
@@ -2296,7 +2296,7 @@ class TestS3PromptLoading:
         from botocore.exceptions import ClientError
 
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompt.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/custom_prompt.txt')
 
         with patch('boto3.client') as mock_client:
             mock_s3 = MagicMock()
@@ -2313,7 +2313,7 @@ class TestS3PromptLoading:
     def test_load_prompt_caches_result(self, monkeypatch):
         """Test that load_prompt caches the result and doesn't reload on subsequent calls."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompt.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/custom_prompt.txt')
 
         custom_prompt = "Custom prompt content"
 
@@ -2340,21 +2340,19 @@ class TestS3PromptLoading:
         monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
         monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')
 
-        # First call
-        prompt1 = load_prompt()
+        # First call with empty string
+        prompt1 = load_prompt("")
         assert prompt1 == handler.DEFAULT_PROMPT
 
-        # Modify env var (shouldn't matter due to cache)
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'should-not-be-used.txt')
-
-        # Second call - should still return cached DEFAULT_PROMPT
-        prompt2 = load_prompt()
+        # Second call with empty string - should return cached DEFAULT_PROMPT
+        # (explicitly pass empty string to request default, not read from env var)
+        prompt2 = load_prompt("")
         assert prompt2 == handler.DEFAULT_PROMPT
 
     def test_lambda_handler_with_s3_override(self, monkeypatch):
         """Test lambda_handler end-to-end with S3 prompt override."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompt.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/custom_prompt.txt')
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -2397,7 +2395,7 @@ class TestS3PromptLoading:
             # Verify S3 was called
             mock_s3.get_object.assert_called_once_with(
                 Bucket='my-bucket',
-                Key='custom_prompt.txt'
+                Key='custom_prompts/custom_prompt.txt'
             )
 
             # Verify custom prompt was used in Bedrock call
@@ -2413,7 +2411,7 @@ class TestS3PromptLoading:
         from botocore.exceptions import ClientError
 
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'missing.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/missing.txt')
         monkeypatch.setenv('MODEL_ID', 'test-model')
         monkeypatch.setenv('MAX_TOKENS', '1000')
         monkeypatch.setenv('TEMPERATURE', '0.5')
@@ -2445,7 +2443,7 @@ class TestS3PromptLoading:
     def test_load_prompt_logs_s3_mode(self, monkeypatch, caplog):
         """Test that load_prompt logs when loading from S3."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/custom.txt')
 
         custom_prompt = "Custom prompt"
 
@@ -2461,7 +2459,7 @@ class TestS3PromptLoading:
                 load_prompt()
 
             assert 'Loading custom prompt from S3' in caplog.text
-            assert 's3://my-bucket/custom.txt' in caplog.text
+            assert 's3://my-bucket/custom_prompts/custom.txt' in caplog.text
             assert 'Successfully loaded custom prompt from S3' in caplog.text
 
 
@@ -2471,9 +2469,9 @@ class TestS3EdgeCasesAndErrors:
     @pytest.fixture(autouse=True)
     def reset_prompt_cache(self):
         """Reset the global prompt cache before each test."""
-        handler.PROMPT_TEMPLATE = None
+        handler.PROMPT_CACHE = {}
         yield
-        handler.PROMPT_TEMPLATE = None
+        handler.PROMPT_CACHE = {}
 
     def test_missing_prompt_bucket_env_var_raises_keyerror(self, monkeypatch):
         """Test that missing PROMPT_BUCKET raises KeyError."""
@@ -2504,7 +2502,7 @@ class TestS3EdgeCasesAndErrors:
     def test_load_prompt_with_empty_s3_file(self, monkeypatch):
         """Test loading empty file from S3 returns empty string."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'empty.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/empty.txt')
 
         with patch('boto3.client') as mock_client:
             mock_s3 = MagicMock()
@@ -2519,7 +2517,7 @@ class TestS3EdgeCasesAndErrors:
     def test_load_prompt_with_very_large_file(self, monkeypatch):
         """Test loading 1MB prompt from S3."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'large.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/large.txt')
 
         large_prompt = "A" * (1024 * 1024)  # 1MB
 
@@ -2537,7 +2535,7 @@ class TestS3EdgeCasesAndErrors:
     def test_load_prompt_with_10mb_file(self, monkeypatch):
         """Test loading 10MB prompt from S3."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'very_large.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/very_large.txt')
 
         very_large_prompt = "B" * (10 * 1024 * 1024)  # 10MB
 
@@ -2557,7 +2555,7 @@ class TestS3EdgeCasesAndErrors:
         from botocore.exceptions import ClientError
 
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/custom.txt')
 
         with patch('boto3.client') as mock_client:
             mock_s3 = MagicMock()
@@ -2576,7 +2574,7 @@ class TestS3EdgeCasesAndErrors:
         from botocore.exceptions import ClientError
 
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/custom.txt')
 
         with patch('boto3.client') as mock_client:
             mock_s3 = MagicMock()
@@ -2596,7 +2594,7 @@ class TestS3EdgeCasesAndErrors:
         from botocore.exceptions import ClientError
 
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'archived.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/archived.txt')
 
         with patch('boto3.client') as mock_client:
             mock_s3 = MagicMock()
@@ -2614,7 +2612,7 @@ class TestS3EdgeCasesAndErrors:
     def test_load_prompt_with_non_utf8_encoding_fails(self, monkeypatch):
         """Test error handling for non-UTF-8 content."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'binary.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/binary.txt')
 
         # Invalid UTF-8 byte sequence
         invalid_utf8 = b'\x80\x81\x82\x83'
@@ -2632,7 +2630,7 @@ class TestS3EdgeCasesAndErrors:
     def test_load_prompt_with_latin1_encoding(self, monkeypatch):
         """Test handling of Latin-1 encoded content."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'latin1.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/latin1.txt')
 
         # Latin-1 specific characters (ñ, é, etc.)
         latin1_text = "Niño está aquí"
@@ -2652,7 +2650,7 @@ class TestS3EdgeCasesAndErrors:
     def test_load_prompt_with_null_bytes(self, monkeypatch):
         """Test handling of content with null bytes."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'null_bytes.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/null_bytes.txt')
 
         content_with_nulls = b'Test\x00content\x00with\x00nulls'
 
@@ -2669,9 +2667,11 @@ class TestS3EdgeCasesAndErrors:
             assert 'Test\x00content' in prompt
 
     def test_very_long_s3_key_name(self, monkeypatch):
-        """Test handling of very long S3 key names (1024 chars)."""
+        """Test handling of very long S3 key names (up to 1024 chars max)."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        long_key = 'a' * 1024
+        # Create key that's exactly at the 1024 char limit (including custom_prompts/ prefix)
+        # 'custom_prompts/' is 16 chars, so we can have 1008 more chars
+        long_key = 'custom_prompts/' + 'a' * 1008
         monkeypatch.setenv('PROMPT_OVERRIDE_KEY', long_key)
 
         custom_prompt = "Test prompt"
@@ -2694,7 +2694,7 @@ class TestS3EdgeCasesAndErrors:
     def test_s3_key_with_special_characters(self, monkeypatch):
         """Test S3 keys with special characters."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        special_key = 'prompts/my-prompt (v2) [final].txt'
+        special_key = 'custom_prompts/my-prompt (v2) [final].txt'
         monkeypatch.setenv('PROMPT_OVERRIDE_KEY', special_key)
 
         custom_prompt = "Test prompt"
@@ -2712,7 +2712,7 @@ class TestS3EdgeCasesAndErrors:
     def test_s3_key_with_unicode_characters(self, monkeypatch):
         """Test S3 keys with Unicode characters."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        unicode_key = 'prompts/日本語/プロンプト.txt'
+        unicode_key = 'custom_prompts/日本語/プロンプト.txt'
         monkeypatch.setenv('PROMPT_OVERRIDE_KEY', unicode_key)
 
         custom_prompt = "Test prompt"
@@ -2730,7 +2730,7 @@ class TestS3EdgeCasesAndErrors:
     def test_concurrent_lambda_invocations_cache_behavior(self, monkeypatch):
         """Test that cache works correctly across multiple calls."""
         monkeypatch.setenv('PROMPT_BUCKET', 'my-bucket')
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/custom.txt')
 
         custom_prompt = "Custom prompt"
 
@@ -2753,7 +2753,7 @@ class TestS3EdgeCasesAndErrors:
         """Test with very long bucket name (63 chars - S3 max)."""
         long_bucket = 'a' * 63
         monkeypatch.setenv('PROMPT_BUCKET', long_bucket)
-        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'test.txt')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/test.txt')
 
         custom_prompt = "Test"
 
@@ -2766,3 +2766,361 @@ class TestS3EdgeCasesAndErrors:
 
             prompt = load_prompt()
             assert prompt == custom_prompt
+
+
+class TestRuntimePromptOverride:
+    """Tests for runtime prompt_override_key parameter functionality."""
+
+    @pytest.fixture(autouse=True)
+    def reset_prompt_cache(self):
+        """Reset the global prompt cache before each test."""
+        handler.PROMPT_CACHE = {}
+        yield
+        handler.PROMPT_CACHE = {}
+
+    @pytest.fixture
+    def mock_env(self, monkeypatch):
+        """Set up required environment variables."""
+        monkeypatch.setenv('PROMPT_BUCKET', 'test-bucket')
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', '')
+        monkeypatch.setenv('MODEL_ID', 'test-model-id')
+        monkeypatch.setenv('MAX_TOKENS', '1000')
+        monkeypatch.setenv('TEMPERATURE', '0.5')
+
+    @pytest.fixture
+    def mock_bedrock_response(self):
+        """Return a mock Bedrock response with valid JSON."""
+        return {
+            'output': {
+                'message': {
+                    'content': [
+                        {
+                            'text': '```json\n{"safe": true, "reasoning": "Valid input"}\n```'
+                        }
+                    ]
+                }
+            }
+        }
+
+    # Path validation tests
+    def test_validate_prompt_override_key_empty_string(self):
+        """Test that empty string is valid (means use default prompt)."""
+        # Should not raise
+        validate_prompt_override_key('')
+
+    def test_validate_prompt_override_key_valid_path(self):
+        """Test that valid path with custom_prompts/ prefix is accepted."""
+        # Should not raise
+        validate_prompt_override_key('custom_prompts/github_tools.txt')
+        validate_prompt_override_key('custom_prompts/validators/correction.txt')
+
+    def test_validate_prompt_override_key_missing_prefix(self):
+        """Test that path without custom_prompts/ prefix is rejected."""
+        with pytest.raises(ValueError, match="must start with 'custom_prompts/'"):
+            validate_prompt_override_key('github_tools.txt')
+
+    def test_validate_prompt_override_key_wrong_prefix(self):
+        """Test that path with wrong prefix is rejected."""
+        with pytest.raises(ValueError, match="must start with 'custom_prompts/'"):
+            validate_prompt_override_key('prompts/github_tools.txt')
+
+    def test_validate_prompt_override_key_path_traversal_dotdot(self):
+        """Test that path traversal with .. is rejected."""
+        with pytest.raises(ValueError, match="cannot contain '..'"):
+            validate_prompt_override_key('custom_prompts/../secrets.txt')
+
+    def test_validate_prompt_override_key_path_traversal_before_prefix(self):
+        """Test that .. before prefix is rejected (caught by prefix check)."""
+        with pytest.raises(ValueError, match="must start with 'custom_prompts/'"):
+            validate_prompt_override_key('../custom_prompts/file.txt')
+
+    def test_validate_prompt_override_key_null_byte(self):
+        """Test that null byte injection is rejected."""
+        with pytest.raises(ValueError, match="contains invalid null byte"):
+            validate_prompt_override_key('custom_prompts/file.txt\x00malicious')
+
+    def test_validate_prompt_override_key_too_long(self):
+        """Test that excessively long keys are rejected."""
+        long_key = 'custom_prompts/' + 'a' * 2000
+        with pytest.raises(ValueError, match="exceeds maximum length"):
+            validate_prompt_override_key(long_key)
+
+    def test_validate_prompt_override_key_directory_only(self):
+        """Test that directory-only path is rejected."""
+        with pytest.raises(ValueError, match="must specify a file"):
+            validate_prompt_override_key('custom_prompts/')
+
+    def test_validate_prompt_override_key_trailing_slash(self):
+        """Test that path with trailing slash is rejected."""
+        with pytest.raises(ValueError, match="must specify a file"):
+            validate_prompt_override_key('custom_prompts/subdir/')
+
+    # Runtime parameter precedence tests
+    def test_runtime_parameter_takes_precedence_over_env_var(self, mock_env, mock_bedrock_response, monkeypatch):
+        """Test that runtime prompt_override_key takes precedence over environment variable."""
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/env_prompt.txt')
+
+        runtime_prompt = "Runtime prompt content"
+        env_prompt = "Environment prompt content"
+        event = {
+            'user_input': 'test input',
+            'prompt_override_key': 'custom_prompts/runtime_prompt.txt'
+        }
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_bedrock = MagicMock()
+            mock_bedrock.converse.return_value = mock_bedrock_response
+
+            # S3 should return different content based on key
+            def s3_get_object_side_effect(Bucket, Key):
+                if Key == 'custom_prompts/runtime_prompt.txt':
+                    return {'Body': Mock(read=Mock(return_value=runtime_prompt.encode('utf-8')))}
+                elif Key == 'custom_prompts/env_prompt.txt':
+                    return {'Body': Mock(read=Mock(return_value=env_prompt.encode('utf-8')))}
+                raise Exception(f"Unexpected S3 key: {Key}")
+
+            mock_s3.get_object.side_effect = s3_get_object_side_effect
+
+            def client_side_effect(service, **kwargs):
+                if service == 's3':
+                    return mock_s3
+                elif service == 'bedrock-runtime':
+                    return mock_bedrock
+                return MagicMock()
+
+            mock_client.side_effect = client_side_effect
+
+            result = lambda_handler(event, None)
+
+            # Verify runtime prompt was used
+            mock_s3.get_object.assert_called_once_with(
+                Bucket='test-bucket',
+                Key='custom_prompts/runtime_prompt.txt'
+            )
+
+            # Verify runtime prompt content was sent to Bedrock
+            bedrock_call_args = mock_bedrock.converse.call_args
+            sent_prompt = bedrock_call_args[1]['messages'][0]['content'][0]['text']
+            assert runtime_prompt in sent_prompt
+            assert env_prompt not in sent_prompt
+
+    def test_falls_back_to_env_var_when_no_runtime_parameter(self, mock_env, mock_bedrock_response, monkeypatch):
+        """Test that env var is used when runtime parameter not provided."""
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/env_prompt.txt')
+
+        env_prompt = "Environment prompt content"
+        event = {'user_input': 'test input'}  # No prompt_override_key
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=env_prompt.encode('utf-8')))
+            }
+            mock_bedrock = MagicMock()
+            mock_bedrock.converse.return_value = mock_bedrock_response
+
+            def client_side_effect(service, **kwargs):
+                if service == 's3':
+                    return mock_s3
+                elif service == 'bedrock-runtime':
+                    return mock_bedrock
+                return MagicMock()
+
+            mock_client.side_effect = client_side_effect
+
+            result = lambda_handler(event, None)
+
+            # Verify env var prompt was used
+            mock_s3.get_object.assert_called_once_with(
+                Bucket='test-bucket',
+                Key='custom_prompts/env_prompt.txt'
+            )
+
+    def test_uses_default_when_both_runtime_and_env_empty(self, mock_env, mock_bedrock_response):
+        """Test that DEFAULT_PROMPT is used when both runtime and env var are empty."""
+        event = {'user_input': 'test input'}  # No prompt_override_key
+
+        with patch('boto3.client') as mock_client:
+            mock_bedrock = MagicMock()
+            mock_bedrock.converse.return_value = mock_bedrock_response
+            mock_client.return_value = mock_bedrock
+
+            result = lambda_handler(event, None)
+
+            # Verify Bedrock was called with default prompt
+            bedrock_call_args = mock_bedrock.converse.call_args
+            sent_prompt = bedrock_call_args[1]['messages'][0]['content'][0]['text']
+            assert '=== BEGIN SYSTEM INSTRUCTIONS ===' in sent_prompt
+            assert 'security analyzer' in sent_prompt
+
+    def test_runtime_parameter_whitespace_treated_as_empty(self, mock_env, mock_bedrock_response):
+        """Test that whitespace-only runtime parameter is treated as empty."""
+        event = {
+            'user_input': 'test input',
+            'prompt_override_key': '   \t\n   '
+        }
+
+        with patch('boto3.client') as mock_client:
+            mock_bedrock = MagicMock()
+            mock_bedrock.converse.return_value = mock_bedrock_response
+            mock_client.return_value = mock_bedrock
+
+            result = lambda_handler(event, None)
+
+            # Should use default prompt (no S3 call)
+            bedrock_call_args = mock_bedrock.converse.call_args
+            sent_prompt = bedrock_call_args[1]['messages'][0]['content'][0]['text']
+            assert '=== BEGIN SYSTEM INSTRUCTIONS ===' in sent_prompt
+
+    # Caching tests
+    def test_caching_works_with_multiple_prompts(self, mock_env, mock_bedrock_response):
+        """Test that caching works correctly with multiple different prompts."""
+        prompt1_content = "First custom prompt"
+        prompt2_content = "Second custom prompt"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_bedrock = MagicMock()
+            mock_bedrock.converse.return_value = mock_bedrock_response
+
+            def s3_get_object_side_effect(Bucket, Key):
+                if Key == 'custom_prompts/prompt1.txt':
+                    return {'Body': Mock(read=Mock(return_value=prompt1_content.encode('utf-8')))}
+                elif Key == 'custom_prompts/prompt2.txt':
+                    return {'Body': Mock(read=Mock(return_value=prompt2_content.encode('utf-8')))}
+                raise Exception(f"Unexpected S3 key: {Key}")
+
+            mock_s3.get_object.side_effect = s3_get_object_side_effect
+
+            def client_side_effect(service, **kwargs):
+                if service == 's3':
+                    return mock_s3
+                elif service == 'bedrock-runtime':
+                    return mock_bedrock
+                return MagicMock()
+
+            mock_client.side_effect = client_side_effect
+
+            # First request with prompt1
+            event1 = {'user_input': 'test1', 'prompt_override_key': 'custom_prompts/prompt1.txt'}
+            lambda_handler(event1, None)
+            assert mock_s3.get_object.call_count == 1
+
+            # Second request with prompt1 (should use cache)
+            lambda_handler(event1, None)
+            assert mock_s3.get_object.call_count == 1  # Still 1
+
+            # Third request with prompt2 (should load from S3)
+            event2 = {'user_input': 'test2', 'prompt_override_key': 'custom_prompts/prompt2.txt'}
+            lambda_handler(event2, None)
+            assert mock_s3.get_object.call_count == 2
+
+            # Fourth request with prompt2 (should use cache)
+            lambda_handler(event2, None)
+            assert mock_s3.get_object.call_count == 2  # Still 2
+
+            # Fifth request with prompt1 again (should use cache)
+            lambda_handler(event1, None)
+            assert mock_s3.get_object.call_count == 2  # Still 2
+
+    def test_default_prompt_cached_separately(self, mock_env, mock_bedrock_response):
+        """Test that default prompt is cached separately from custom prompts."""
+        custom_prompt = "Custom prompt"
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=custom_prompt.encode('utf-8')))
+            }
+            mock_bedrock = MagicMock()
+            mock_bedrock.converse.return_value = mock_bedrock_response
+
+            def client_side_effect(service, **kwargs):
+                if service == 's3':
+                    return mock_s3
+                elif service == 'bedrock-runtime':
+                    return mock_bedrock
+                return MagicMock()
+
+            mock_client.side_effect = client_side_effect
+
+            # Request with default prompt
+            event_default = {'user_input': 'test'}
+            lambda_handler(event_default, None)
+            assert mock_s3.get_object.call_count == 0  # No S3 call for default
+
+            # Request with custom prompt
+            event_custom = {'user_input': 'test', 'prompt_override_key': 'custom_prompts/custom.txt'}
+            lambda_handler(event_custom, None)
+            assert mock_s3.get_object.call_count == 1  # S3 call for custom
+
+            # Request with default again (should use cache)
+            lambda_handler(event_default, None)
+            assert mock_s3.get_object.call_count == 1  # Still 1
+
+            # Request with custom again (should use cache)
+            lambda_handler(event_custom, None)
+            assert mock_s3.get_object.call_count == 1  # Still 1
+
+    # Invalid path rejection tests
+    def test_runtime_parameter_invalid_path_rejected(self, mock_env):
+        """Test that invalid runtime path is rejected immediately."""
+        event = {
+            'user_input': 'test input',
+            'prompt_override_key': 'invalid_path.txt'  # Missing custom_prompts/ prefix
+        }
+
+        with pytest.raises(ValueError, match="must start with 'custom_prompts/'"):
+            lambda_handler(event, None)
+
+    def test_env_var_invalid_path_rejected(self, mock_env, monkeypatch):
+        """Test that invalid env var path is rejected."""
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'invalid_path.txt')
+        event = {'user_input': 'test input'}
+
+        with pytest.raises(ValueError, match="must start with 'custom_prompts/'"):
+            lambda_handler(event, None)
+
+    def test_runtime_parameter_path_traversal_rejected(self, mock_env):
+        """Test that path traversal in runtime parameter is rejected."""
+        event = {
+            'user_input': 'test input',
+            'prompt_override_key': 'custom_prompts/../secrets.txt'
+        }
+
+        with pytest.raises(ValueError, match="cannot contain '..'"):
+            lambda_handler(event, None)
+
+    # Backward compatibility tests
+    def test_backward_compatibility_env_var_only(self, mock_env, mock_bedrock_response, monkeypatch):
+        """Test backward compatibility with env var only (no runtime parameter)."""
+        monkeypatch.setenv('PROMPT_OVERRIDE_KEY', 'custom_prompts/legacy_prompt.txt')
+
+        legacy_prompt = "Legacy prompt content"
+        event = {'user_input': 'test input'}  # Old-style event without prompt_override_key
+
+        with patch('boto3.client') as mock_client:
+            mock_s3 = MagicMock()
+            mock_s3.get_object.return_value = {
+                'Body': Mock(read=Mock(return_value=legacy_prompt.encode('utf-8')))
+            }
+            mock_bedrock = MagicMock()
+            mock_bedrock.converse.return_value = mock_bedrock_response
+
+            def client_side_effect(service, **kwargs):
+                if service == 's3':
+                    return mock_s3
+                elif service == 'bedrock-runtime':
+                    return mock_bedrock
+                return MagicMock()
+
+            mock_client.side_effect = client_side_effect
+
+            result = lambda_handler(event, None)
+
+            assert result['safe'] is True
+            mock_s3.get_object.assert_called_once_with(
+                Bucket='test-bucket',
+                Key='custom_prompts/legacy_prompt.txt'
+            )

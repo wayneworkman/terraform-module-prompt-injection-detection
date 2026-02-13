@@ -6,6 +6,7 @@ Created by [Wayne Workman](https://github.com/wayneworkman)
 [![GitHub](https://img.shields.io/badge/GitHub-wayneworkman-181717?logo=github)](https://github.com/wayneworkman)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Wayne_Workman-0077B5?logo=linkedin)](https://www.linkedin.com/in/wayne-workman-a8b37b353/)
 [![SpinnyLights](https://img.shields.io/badge/SpinnyLights-wayneworkman-764ba2)](https://spinnylights.com/wayneworkman)
+[![Coverage](https://img.shields.io/badge/Coverage-98%25-brightgreen)](https://github.com/wayneworkman/terraform-module-prompt-injection-detection)
 
 This Terraform module deploys an AWS Lambda function that uses Amazon Bedrock to detect prompt injection attempts in user input. The module implements the security principles outlined in [this hands-on demo](https://wayne.theworkmans.us/posts/2025/10/2025-10-18-prompt-injection-hands-on-demo.html).
 
@@ -99,45 +100,98 @@ module "prompt_injection_detector" {
 
 ### S3-Based Prompt Override
 
-The module creates an S3 bucket for storing custom detection prompts and Lambda has both **read and write permissions** to the bucket. This solves the 4KB Lambda environment variable limit for large, context-aware prompts and enables future enhancements like storing detected injection attempts.
+The module creates an S3 bucket for storing custom detection prompts and Lambda has both **read and write permissions** to the bucket (restricted to the `custom_prompts/` path). This solves the 4KB Lambda environment variable limit for large, context-aware prompts and enables future enhancements like storing detected injection attempts.
+
+**IMPORTANT**: All custom prompts must be stored under the `custom_prompts/` path in S3 (e.g., `custom_prompts/my_prompt.txt`). This path restriction is enforced for security.
 
 **Default Behavior** (no override):
 - Module uses a hardcoded default prompt in the Lambda code
 - Works out-of-the-box with strict, general-purpose detection
 - No S3 file needed
 
-**Custom Prompt Override**:
+#### Option 1: Deploy-Time Prompt Override (Environment Variable)
+
+Configure a custom prompt at deployment time using the `prompt_override_key` variable:
 
 ```hcl
 module "prompt_injection_detector" {
   source = "git@github.com:wayneworkman/terraform-module-prompt-injection-detection.git"
 
   lambda_name_prepend  = "myapp"
-  prompt_override_key  = "custom_detection_prompt.txt"
+  prompt_override_key  = "custom_prompts/detection_prompt.txt"  # Must start with custom_prompts/
 }
 
 # Upload custom prompt to module-created bucket
 resource "aws_s3_object" "custom_prompt" {
   bucket  = module.prompt_injection_detector.bucket_id
-  key     = "custom_detection_prompt.txt"
+  key     = "custom_prompts/detection_prompt.txt"
   content = file("${path.module}/my_custom_prompt.txt")
 }
 ```
 
+#### Option 2: Runtime Prompt Override (Event Payload)
+
+**New in v0.2.0**: You can now specify different prompts per invocation using the `prompt_override_key` parameter in the event payload. This allows a single Lambda to handle multiple validation use cases with different detection prompts.
+
+```python
+import boto3
+import json
+
+lambda_client = boto3.client('lambda')
+
+# Use custom GitHub tools validation prompt
+response = lambda_client.invoke(
+    FunctionName='prompt-injection-detection',
+    Payload=json.dumps({
+        'user_input': 'GitHub PR output here',
+        'prompt_override_key': 'custom_prompts/github_tools_prompt.txt'  # Runtime override
+    })
+)
+
+# Use custom correction validator prompt
+response = lambda_client.invoke(
+    FunctionName='prompt-injection-detection',
+    Payload=json.dumps({
+        'user_input': 'Correction text here',
+        'prompt_override_key': 'custom_prompts/correction_validator.txt'  # Different prompt
+    })
+)
+
+# Use default prompt
+response = lambda_client.invoke(
+    FunctionName='prompt-injection-detection',
+    Payload=json.dumps({
+        'user_input': 'Regular user input'
+        # No prompt_override_key = uses DEFAULT_PROMPT
+    })
+)
+```
+
+**Priority Order**:
+1. **Runtime parameter** (event payload `prompt_override_key`) - takes precedence
+2. **Environment variable** (Terraform `prompt_override_key`) - fallback
+3. **Default prompt** (hardcoded `DEFAULT_PROMPT`) - final fallback
+
 **Key Points**:
 - **S3 bucket is always created** - provides `bucket_id` and `bucket_arn` outputs
-- **Lambda has read/write permissions** - can read prompts and write logs/detected attempts to bucket
-- **If `prompt_override_key` is empty/not set** → Uses hardcoded default prompt
-- **If `prompt_override_key` is specified** → Reads prompt from S3 (fails hard if key doesn't exist)
-- **Prompt is cached** - Loaded once per Lambda container lifecycle (performance optimization)
+- **Lambda has read/write permissions** - can read prompts from `custom_prompts/*` path only
+- **Path restriction enforced** - all custom prompts must be under `custom_prompts/` (e.g., `custom_prompts/my_prompt.txt`)
+- **Path traversal prevention** - keys containing `..` or not starting with `custom_prompts/` are rejected
+- **Runtime parameter takes precedence** - event payload `prompt_override_key` overrides environment variable
+- **If no override specified** → Uses hardcoded default prompt
+- **Prompt is cached per key** - each unique prompt is loaded once per Lambda container lifecycle
+- **Multi-prompt support** - single Lambda can use different prompts for different use cases
 - **No size limit** - S3 supports prompts of any size
+- **Fails hard on errors** - missing S3 keys or invalid paths cause immediate failure (no silent degradation)
 
 **Benefits**:
 - Bypass 4KB environment variable limit
-- Support context-aware prompts (multiple input types, correction handling)
+- **Single Lambda for multiple use cases** - use different prompts without deploying multiple Lambdas
+- Support context-aware prompts (multiple input types, correction handling, GitHub tools validation)
 - Reduce false positives with custom detection logic
 - Maintain default strict behavior when override not needed
 - Enable future enhancements (e.g., storing detected injection attempts for analysis)
+- **No redeployment needed** - change prompts at runtime by updating S3 objects
 
 ### S3 Access Logging (Optional)
 
@@ -175,14 +229,25 @@ module "prompt_injection_detector" {
 
 ### Invoking the Lambda
 
-You can invoke the Lambda function using AWS SDK, CLI, or from another Lambda:
+You can invoke the Lambda function using AWS SDK, CLI, or from another Lambda. Optionally specify a runtime `prompt_override_key` to use a custom prompt for specific requests.
 
 #### AWS CLI
 
+**Basic invocation (uses default prompt or env var prompt):**
 ```bash
 aws lambda invoke \
   --function-name prompt-injection-detection \
   --payload '{"user_input": "What is the weather today?"}' \
+  response.json
+
+cat response.json
+```
+
+**With runtime prompt override:**
+```bash
+aws lambda invoke \
+  --function-name prompt-injection-detection \
+  --payload '{"user_input": "GitHub tool output", "prompt_override_key": "custom_prompts/github_validator.txt"}' \
   response.json
 
 cat response.json
@@ -196,6 +261,7 @@ import json
 
 lambda_client = boto3.client('lambda')
 
+# Basic invocation (uses default prompt or env var prompt)
 response = lambda_client.invoke(
     FunctionName='prompt-injection-detection',
     InvocationType='RequestResponse',
@@ -207,6 +273,20 @@ response = lambda_client.invoke(
 result = json.loads(response['Payload'].read())
 print(result)
 # Output: {'safe': False, 'reasoning': 'The input contains a clear prompt injection attempt...'}
+
+# With runtime prompt override (different prompt for specific use case)
+response = lambda_client.invoke(
+    FunctionName='prompt-injection-detection',
+    InvocationType='RequestResponse',
+    Payload=json.dumps({
+        'user_input': 'GitHub tool output to validate',
+        'prompt_override_key': 'custom_prompts/github_validator.txt'
+    })
+)
+
+result = json.loads(response['Payload'].read())
+print(result)
+# Output: {'safe': True, 'reasoning': '...'}
 ```
 
 #### Integration with API Gateway
@@ -254,6 +334,30 @@ resource "aws_lambda_permission" "apigw" {
 | `cloudwatch_log_group_arn` | ARN of the CloudWatch log group |
 | `bucket_id` | S3 bucket ID for prompt storage |
 | `bucket_arn` | S3 bucket ARN for prompt storage |
+
+## Event Payload Format
+
+The Lambda function accepts a JSON event with the following fields:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `user_input` | string | **Yes** | The user input text to analyze for prompt injection |
+| `prompt_override_key` | string | No | S3 key for custom prompt (must start with `custom_prompts/`). If not provided, uses environment variable or default prompt. |
+
+**Examples:**
+
+```json
+{
+  "user_input": "What is the weather today?"
+}
+```
+
+```json
+{
+  "user_input": "GitHub tool output to validate",
+  "prompt_override_key": "custom_prompts/github_validator.txt"
+}
+```
 
 ## Response Format
 

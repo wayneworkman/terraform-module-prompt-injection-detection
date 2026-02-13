@@ -11,8 +11,9 @@ import logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Cache for prompt template (loaded once per Lambda container lifecycle)
-PROMPT_TEMPLATE = None
+# Cache for prompt templates (keyed by prompt source for multi-prompt support)
+# Key format: "DEFAULT" for hardcoded prompt, or the S3 key for custom prompts
+PROMPT_CACHE = {}
 
 # Default hardcoded prompt (used when no S3 override is specified)
 DEFAULT_PROMPT = """=== BEGIN SYSTEM INSTRUCTIONS ===
@@ -63,28 +64,85 @@ Do not include any other text, markdown formatting, or explanations outside of t
 === BEGIN USER REQUEST ==="""
 
 
-def load_prompt() -> str:
+def validate_prompt_override_key(key: str) -> None:
     """
-    Load prompt template (cached after first call).
+    Validate prompt_override_key to prevent path traversal and ensure proper path prefix.
 
-    If PROMPT_OVERRIDE_KEY is provided, reads from S3.
-    Otherwise, uses hardcoded DEFAULT_PROMPT.
+    Args:
+        key: The S3 key to validate
+
+    Raises:
+        ValueError: If key is invalid or doesn't meet security requirements
+    """
+    if not key:
+        return  # Empty string is valid (means use default prompt)
+
+    # Check maximum length
+    if len(key) > 1024:
+        raise ValueError("prompt_override_key exceeds maximum length of 1024 characters")
+
+    # Check for null bytes (path traversal technique)
+    if '\x00' in key:
+        raise ValueError("prompt_override_key contains invalid null byte")
+
+    # Must start with custom_prompts/ prefix
+    if not key.startswith("custom_prompts/"):
+        raise ValueError("prompt_override_key must start with 'custom_prompts/' (e.g., 'custom_prompts/my_prompt.txt')")
+
+    # Prevent path traversal attempts
+    if ".." in key:
+        raise ValueError("prompt_override_key cannot contain '..' (path traversal attempt)")
+
+    # Ensure there's actually a filename after the prefix
+    if key == "custom_prompts/" or key.endswith("/"):
+        raise ValueError("prompt_override_key must specify a file, not just a directory")
+
+
+def load_prompt(prompt_override_key: str = None) -> str:
+    """
+    Load prompt template (cached per unique prompt source).
+
+    Priority order:
+    1. Use provided prompt_override_key parameter (runtime) if not None
+    2. Fall back to PROMPT_OVERRIDE_KEY environment variable (deploy-time)
+    3. Use hardcoded DEFAULT_PROMPT
+
+    Args:
+        prompt_override_key: Optional S3 key for custom prompt (runtime parameter).
+                           If None, reads from PROMPT_OVERRIDE_KEY env var.
+                           If empty string, uses DEFAULT_PROMPT.
 
     Returns:
         str: The prompt template to use
 
     Raises:
-        ValueError: If S3 key specified but doesn't exist
+        ValueError: If S3 key specified but doesn't exist or is invalid
         Exception: For other S3 errors
     """
-    global PROMPT_TEMPLATE
+    global PROMPT_CACHE
+
+    # If no parameter provided, read from environment variable
+    if prompt_override_key is None:
+        prompt_override_key = os.environ.get('PROMPT_OVERRIDE_KEY', '').strip()
+    else:
+        # Parameter was explicitly provided (even if empty string), so use it
+        prompt_override_key = prompt_override_key.strip()
+
+    # Validate the key
+    validate_prompt_override_key(prompt_override_key)
+
+    # Determine cache key for this prompt source
+    if prompt_override_key:
+        cache_key = prompt_override_key
+    else:
+        cache_key = "DEFAULT"
 
     # Return cached value if already loaded
-    if PROMPT_TEMPLATE is not None:
-        return PROMPT_TEMPLATE
+    if cache_key in PROMPT_CACHE:
+        logger.info(f"Using cached prompt (cache_key={cache_key})")
+        return PROMPT_CACHE[cache_key]
 
     prompt_bucket = os.environ['PROMPT_BUCKET']
-    prompt_override_key = os.environ.get('PROMPT_OVERRIDE_KEY', '').strip()
 
     if prompt_override_key:
         # Custom prompt mode - read from S3
@@ -92,8 +150,12 @@ def load_prompt() -> str:
         try:
             s3 = boto3.client('s3')
             response = s3.get_object(Bucket=prompt_bucket, Key=prompt_override_key)
-            PROMPT_TEMPLATE = response['Body'].read().decode('utf-8')
-            logger.info(f"Successfully loaded custom prompt from S3 ({len(PROMPT_TEMPLATE)} characters)")
+            prompt_template = response['Body'].read().decode('utf-8')
+            logger.info(f"Successfully loaded custom prompt from S3 ({len(prompt_template)} characters)")
+
+            # Cache it
+            PROMPT_CACHE[cache_key] = prompt_template
+            return prompt_template
         except ClientError as e:
             error_code = e.response['Error']['Code']
             if error_code == 'NoSuchKey':
@@ -108,10 +170,12 @@ def load_prompt() -> str:
             raise
     else:
         # Default prompt mode
-        PROMPT_TEMPLATE = DEFAULT_PROMPT
-        logger.info(f"Using default hardcoded prompt ({len(PROMPT_TEMPLATE)} characters)")
+        prompt_template = DEFAULT_PROMPT
+        logger.info(f"Using default hardcoded prompt ({len(prompt_template)} characters)")
 
-    return PROMPT_TEMPLATE
+        # Cache it
+        PROMPT_CACHE[cache_key] = prompt_template
+        return prompt_template
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -121,7 +185,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Analyzes user input using AWS Bedrock to detect prompt injection attempts.
 
     Args:
-        event: Lambda event containing 'user_input' field
+        event: Lambda event containing:
+            - 'user_input' (required): The text to analyze
+            - 'prompt_override_key' (optional): S3 key for custom prompt (must start with 'custom_prompts/')
         context: Lambda context
 
     Returns:
@@ -131,8 +197,21 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         KeyError: If required environment variables are missing
         ValueError: If environment variables have invalid values or S3 key not found
     """
+    # Determine which prompt to use (runtime parameter takes precedence over env var)
+    runtime_prompt_key = event.get('prompt_override_key', '').strip()
+    env_prompt_key = os.environ.get('PROMPT_OVERRIDE_KEY', '').strip()
+
+    # Validate environment variable if it's set (for backward compatibility)
+    if env_prompt_key:
+        validate_prompt_override_key(env_prompt_key)
+
+    # Use runtime parameter if provided, otherwise fall back to environment variable
+    prompt_override_key = runtime_prompt_key or env_prompt_key
+
+    logger.info(f"Prompt selection: runtime_key='{runtime_prompt_key}', env_key='{env_prompt_key}', selected='{prompt_override_key}'")
+
     # Load prompt template (from S3 if override specified, otherwise use default)
-    prompt_template = load_prompt()
+    prompt_template = load_prompt(prompt_override_key)
 
     # Get required environment variables - fail hard if not present
     model_id = os.environ['MODEL_ID']
